@@ -5,18 +5,24 @@
 </div>
 <hr>
 
+
 <div align="center" style="line-height: 1;">
+  <img src='assets/longcat_video_title.svg' alt="LongCat-Video">
   <a href='https://meituan-longcat.github.io/LongCat-Video/'><img src='https://img.shields.io/badge/Project-Page-green'></a>
   <a href='https://arxiv.org/abs/2510.22200'><img src='https://img.shields.io/badge/Technique-Report-red'></a>
   <a href='https://huggingface.co/meituan-longcat/LongCat-Video'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue'></a>
 </div>
-
 <div align="center" style="line-height: 1;">
+  <img src='assets/longcat_video_avatar_title.svg' alt="LongCat-Video-Avatar">
+  <a href='https://meigen-ai.github.io/LongCat-Video-Avatar/'><img src='https://img.shields.io/badge/Project-Page-green'></a>
+  <a href='https://github.com/meituan-longcat/LongCat-Video'><img src='https://img.shields.io/badge/Technique-Report-red'></a>
+  <a href='https://huggingface.co/meituan-longcat/LongCat-Video-Avatar'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue'></a>
+</div>
+<div align="center" style="line-height: 1;">
+  <img src='assets/title_placeholder.svg' alt="placeholder">
+  </a>
   <a href='https://github.com/meituan-longcat/LongCat-Flash-Chat/blob/main/figures/wechat_official_accounts.png'><img src='https://img.shields.io/badge/WeChat-LongCat-brightgreen?logo=wechat&logoColor=white'></a>  
   <a href='https://x.com/Meituan_LongCat'><img src='https://img.shields.io/badge/Twitter-LongCat-white?logo=x&logoColor=white'></a>
-</div>
-
-<div align="center" style="line-height: 1;">
   <a href='LICENSE'><img src='https://img.shields.io/badge/License-MIT-f5de53?&color=f5de53'></a>
 </div>
 
@@ -87,8 +93,7 @@ FlashAttention-2 is enabled in the model config by default; you can also change 
 | Models | Description | Download Link |
 | --- | --- | --- |
 | LongCat-Video | foundational video generation | 🤗 [Huggingface](https://huggingface.co/meituan-longcat/LongCat-Video) |
-| LongCat-Video-Avatar-Single | single-character audio-driven video generation  | 🤗 [Huggingface](https://huggingface.co/meituan-longcat/LongCat-Video-Avatar) |
-| LongCat-Video-Avatar-Multi | multi-character audio-driven video generation | 🤗 [Huggingface](https://huggingface.co/meituan-longcat/LongCat-Video-Avatar) |
+| LongCat-Video-Avatar | single- and multi-character audio-driven video generation | 🤗 [Huggingface](https://huggingface.co/meituan-longcat/LongCat-Video-Avatar) |
 
 Download models using huggingface-cli:
 ```shell
