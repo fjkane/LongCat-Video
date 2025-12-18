@@ -96,8 +96,6 @@ def generate(args):
     pipe.dit.load_lora(cfg_step_lora_path, 'cfg_step_lora')
     pipe.dit.enable_loras(['cfg_step_lora'])
 
-    if enable_compile:
-        dit = torch.compile(dit)
 
     output_distill = pipe.generate_t2v(
         prompt=prompt,
@@ -122,8 +120,6 @@ def generate(args):
     pipe.dit.enable_loras(['refinement_lora'])
     pipe.dit.enable_bsa()
 
-    if enable_compile:
-        dit = torch.compile(dit)
 
     stage1_video = [(output_distill[i] * 255).astype(np.uint8) for i in range(output_distill.shape[0])]
     stage1_video = [PIL.Image.fromarray(img) for img in stage1_video]
