@@ -1,4 +1,4 @@
-# LongCat-Video
+# LongCat-Video UV BF16
 
 <div align="center">
   <img src="assets/longcat-video_logo.svg" width="45%" alt="LongCat-Video" />
