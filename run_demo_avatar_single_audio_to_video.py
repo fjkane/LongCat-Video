@@ -84,13 +84,12 @@ def generate(args):
     raw_speech_path = input_data['cond_audio']['person1']
     
     # prepare distributed environment
-    rank = int(os.environ['RANK'])
-    num_gpus = torch.cuda.device_count()
-    local_rank = rank % num_gpus
+    global_rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=3600*24))
-    global_rank    = dist.get_rank()
-    num_processes  = dist.get_world_size()
+
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=3600 * 24))
+    num_processes = dist.get_world_size()
 
     # initialize context parallel
     context_parallel_util.init_context_parallel(context_parallel_size=context_parallel_size, global_rank=global_rank, world_size=num_processes)
@@ -156,17 +155,28 @@ def generate(args):
         if added_sample_nums > 0:
             speech_array = np.append(speech_array, [0.]*added_sample_nums)
 
-        # audio embedding
-        full_audio_emb = pipe.get_audio_embedding(speech_array, fps=save_fps*audio_stride, device="cpu", sample_rate=sr)
+        # audio embedding on CPU (saves VRAM)
+        full_audio_emb = pipe.get_audio_embedding(
+            speech_array,
+            fps=save_fps * audio_stride,
+            device="cpu",
+            sample_rate=sr,
+        )
+
         if torch.isnan(full_audio_emb).any():
-            raise ValueError(f"broken audio embedding with nan values")
+            raise ValueError("broken audio embedding with nan values")
+
+        # IMPORTANT: NCCL broadcast requires CUDA tensors
+        full_audio_emb = full_audio_emb.to(local_rank)
 
         if context_parallel_util.get_cp_size() > 1:
             full_audio_emb_shape_list = list(full_audio_emb.size())
-            full_audio_emb_tensor_shape_list = torch.tensor(full_audio_emb_shape_list, dtype=torch.int64, device=full_audio_emb.device)
+            full_audio_emb_tensor_shape_list = torch.tensor(
+                full_audio_emb_shape_list, dtype=torch.int64, device=local_rank
+            )
             context_parallel_util.cp_broadcast(full_audio_emb_tensor_shape_list)
             context_parallel_util.cp_broadcast(full_audio_emb)
-        
+
         if os.path.exists(temp_vocal_path):
             os.remove(temp_vocal_path)
 
@@ -178,7 +188,7 @@ def generate(args):
         context_parallel_util.cp_broadcast(full_audio_emb)
 
     # prepare audio embedding for the first clip
-    indices = torch.arange(2 * 2 + 1) - 2
+    indices = torch.arange(2 * 2 + 1, device=local_rank) - 2
     audio_start_idx = 0
     audio_end_idx = audio_start_idx + audio_stride * num_frames
 
