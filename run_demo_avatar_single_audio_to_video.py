@@ -192,7 +192,8 @@ def generate(args):
     audio_start_idx = 0
     audio_end_idx = audio_start_idx + audio_stride * num_frames
 
-    center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
+    base = torch.arange(audio_start_idx, audio_end_idx, audio_stride, device=local_rank)
+    center_indices = base.unsqueeze(1) + indices.unsqueeze(0)
     center_indices = torch.clamp(center_indices, min=0, max=full_audio_emb.shape[0]-1)
     audio_emb = full_audio_emb[center_indices][None,...].to(local_rank)
 
@@ -282,7 +283,8 @@ def generate(args):
         # prepare audio embedding for the next clip
         audio_start_idx = audio_start_idx + audio_stride * (num_frames - num_cond_frames)
         audio_end_idx   = audio_start_idx + audio_stride * num_frames
-        center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
+        base = torch.arange(audio_start_idx, audio_end_idx, audio_stride, device=local_rank)
+        center_indices = base.unsqueeze(1) + indices.unsqueeze(0)
         center_indices = torch.clamp(center_indices, min=0, max=full_audio_emb.shape[0]-1)
         audio_emb = full_audio_emb[center_indices][None,...].to(local_rank)
         
