@@ -195,7 +195,7 @@ def generate(args):
     base = torch.arange(audio_start_idx, audio_end_idx, audio_stride, device=local_rank)
     center_indices = base.unsqueeze(1) + indices.unsqueeze(0)
     center_indices = torch.clamp(center_indices, min=0, max=full_audio_emb.shape[0]-1)
-    audio_emb = full_audio_emb[center_indices][None,...].to(local_rank)
+    audio_emb = full_audio_emb[center_indices][None, ...]
 
 
     if local_rank == 0:
@@ -286,7 +286,7 @@ def generate(args):
         base = torch.arange(audio_start_idx, audio_end_idx, audio_stride, device=local_rank)
         center_indices = base.unsqueeze(1) + indices.unsqueeze(0)
         center_indices = torch.clamp(center_indices, min=0, max=full_audio_emb.shape[0]-1)
-        audio_emb = full_audio_emb[center_indices][None,...].to(local_rank)
+        audio_emb = full_audio_emb[center_indices][None, ...]
         
         output_tuple = pipe.generate_avc(
             video=current_video,
