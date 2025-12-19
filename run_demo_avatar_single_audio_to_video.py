@@ -107,7 +107,7 @@ def generate(args):
     
     # initialize audio models
     wav2vec_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')    
-    audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(local_rank)
+    audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to("cpu")
     audio_encoder.feature_extractor._freeze_parameters()
 
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_path, local_files_only=True)
@@ -157,7 +157,7 @@ def generate(args):
             speech_array = np.append(speech_array, [0.]*added_sample_nums)
 
         # audio embedding
-        full_audio_emb = pipe.get_audio_embedding(speech_array, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr) 
+        full_audio_emb = pipe.get_audio_embedding(speech_array, fps=save_fps*audio_stride, device="cpu", sample_rate=sr)
         if torch.isnan(full_audio_emb).any():
             raise ValueError(f"broken audio embedding with nan values")
 
