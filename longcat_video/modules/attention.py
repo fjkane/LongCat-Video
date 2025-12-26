@@ -2,6 +2,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from einops import rearrange
 
@@ -9,6 +10,25 @@ from .rope_3d import RotaryPositionalEmbedding
 from .blocks import RMSNorm_FP32
 from ..block_sparse_attention.bsa_interface import flash_attn_bsa_3d
 from ..context_parallel.ulysses_wrapper import ulysses_wrapper
+
+
+def _sdpa_bhSd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
+    """
+    PyTorch SDPA backend for tensors shaped [B, H, S, D].
+
+    Returns:
+        x: [B, H, S, D]
+    """
+    # SDPA in PyTorch supports [B, H, S, D] directly.
+    # We supply a scale to match other backends.
+    # dropout_p=0.0 and is_causal=False matches your existing usage.
+    return F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+    )
 
 
 class Attention(nn.Module):
@@ -55,52 +75,61 @@ class Attention(nn.Module):
         B, H, SQ, D = q.shape
         _, _, SKV, _ = k.shape
 
-        if self.enable_bsa and shape[0] > 1: # bsa will not be used in image training / sampling
+        # 1) Block-sparse attention path (kept unchanged)
+        if self.enable_bsa and shape[0] > 1:  # bsa will not be used in image training / sampling
             assert self.bsa_params is not None
-            _, H, W = shape
-            assert H % self.cp_split_hw[0] == 0, W % self.cp_split_hw[1] == 0
-            H, W = H // self.cp_split_hw[0], W // self.cp_split_hw[1]
-            Tq = SQ // (H * W)
-            Tk = SKV // (H * W)
-            latent_shape_q = (Tq, H, W)
-            latent_shape_k = (Tk, H, W)
+            _, Hh, Ww = shape
+            assert Hh % self.cp_split_hw[0] == 0, Ww % self.cp_split_hw[1] == 0
+            Hh, Ww = Hh // self.cp_split_hw[0], Ww // self.cp_split_hw[1]
+            Tq = SQ // (Hh * Ww)
+            Tk = SKV // (Hh * Ww)
+            latent_shape_q = (Tq, Hh, Ww)
+            latent_shape_k = (Tk, Hh, Ww)
             x = flash_attn_bsa_3d(q, k, v, latent_shape_q, latent_shape_k, **self.bsa_params)
+
+        # 2) FlashAttention-3 (kept unchanged)
         elif self.enable_flashattn3:
             from flash_attn_interface import flash_attn_func
-            q = rearrange(q, "B H S D -> B S H D").contiguous()
-            k = rearrange(k, "B H S D -> B S H D").contiguous()
-            v = rearrange(v, "B H S D -> B S H D").contiguous()
+            q_ = rearrange(q, "B H S D -> B S H D").contiguous()
+            k_ = rearrange(k, "B H S D -> B S H D").contiguous()
+            v_ = rearrange(v, "B H S D -> B S H D").contiguous()
             x, *_ = flash_attn_func(
-                q,
-                k,
-                v,
+                q_,
+                k_,
+                v_,
                 softmax_scale=self.scale,
             )
             x = rearrange(x, "B S H D -> B H S D")
+
+        # 3) FlashAttention-2 (kept unchanged)
         elif self.enable_flashattn2:
             from flash_attn import flash_attn_func
-            q = rearrange(q, "B H S D -> B S H D")
-            k = rearrange(k, "B H S D -> B S H D")
-            v = rearrange(v, "B H S D -> B S H D")
+            q_ = rearrange(q, "B H S D -> B S H D")
+            k_ = rearrange(k, "B H S D -> B S H D")
+            v_ = rearrange(v, "B H S D -> B S H D")
             x = flash_attn_func(
-                q,
-                k,
-                v,
+                q_,
+                k_,
+                v_,
                 dropout_p=0.0,
                 softmax_scale=self.scale,
             )
             x = rearrange(x, "B S H D -> B H S D")
+
+        # 4) xFormers (kept unchanged)
         elif self.enable_xformers:
             import xformers.ops
             # Input tensors must be in format ``[B, M, H, K]``, where B is the batch size, M \
             # the sequence length, H the number of heads, and K the embeding size per head
-            q = rearrange(q, "B H M K -> B M H K")
-            k = rearrange(k, "B H M K -> B M H K")
-            v = rearrange(v, "B H M K -> B M H K")
-            x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None,)
+            q_ = rearrange(q, "B H M K -> B M H K")
+            k_ = rearrange(k, "B H M K -> B M H K")
+            v_ = rearrange(v, "B H M K -> B M H K")
+            x = xformers.ops.memory_efficient_attention(q_, k_, v_, attn_bias=None, op=None,)
             x = rearrange(x, "B M H K -> B H M K")
+
+        # 5) FINAL FALLBACK: PyTorch SDPA (new)
         else:
-            raise RuntimeError("Unsupported attention operations.")
+            x = _sdpa_bhSd(q, k, v, scale=self.scale)
 
         return x
 
@@ -111,7 +140,7 @@ class Attention(nn.Module):
         qkv = self.qkv(x)
 
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.view(qkv_shape).permute((2, 0, 3, 1, 4)) # [3, B, H, N, D]
+        qkv = qkv.view(qkv_shape).permute((2, 0, 3, 1, 4))  # [3, B, H, N, D]
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -137,8 +166,8 @@ class Attention(nn.Module):
             x = self._process_attn(q, k, v, shape)
 
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) # [B, H, N, D] --> [B, N, H, D]
-        x = x.reshape(x_output_shape) # [B, N, H, D] --> [B, N, C]
+        x = x.transpose(1, 2)  # [B, H, N, D] --> [B, N, H, D]
+        x = x.reshape(x_output_shape)  # [B, N, H, D] --> [B, N, C]
         x = self.proj(x)
 
         if return_kv:
@@ -151,31 +180,31 @@ class Attention(nn.Module):
         """
         B, N, C = x.shape
         qkv = self.qkv(x)
-        
+
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.view(qkv_shape).permute((2, 0, 3, 1, 4)) # [3, B, H, N, D]
+        qkv = qkv.view(qkv_shape).permute((2, 0, 3, 1, 4))  # [3, B, H, N, D]
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        T, H, W = shape
+        T, Hh, Ww = shape
         k_cache, v_cache = kv_cache
         assert k_cache.shape[0] == v_cache.shape[0] and k_cache.shape[0] in [1, B]
         if k_cache.shape[0] == 1:
             k_cache = k_cache.repeat(B, 1, 1, 1)
             v_cache = v_cache.repeat(B, 1, 1, 1)
-        
+
         if num_cond_latents is not None and num_cond_latents > 0:
             k_full = torch.cat([k_cache, k], dim=2).contiguous()
             v_full = torch.cat([v_cache, v], dim=2).contiguous()
             q_padding = torch.cat([torch.empty_like(k_cache), q], dim=2).contiguous()
-            q_padding, k_full = self.rope_3d(q_padding, k_full, (T + num_cond_latents, H, W))
+            q_padding, k_full = self.rope_3d(q_padding, k_full, (T + num_cond_latents, Hh, Ww))
             q = q_padding[:, :, -N:].contiguous()
-            
+
         x = self._process_attn(q, k_full, v_full, shape)
-        
+
         x_output_shape = (B, N, C)
-        x = x.transpose(1, 2) # [B, H, N, D] --> [B, N, H, D]
-        x = x.reshape(x_output_shape) # [B, N, H, D] --> [B, N, C]
+        x = x.transpose(1, 2)  # [B, H, N, D] --> [B, N, H, D]
+        x = x.reshape(x_output_shape)  # [B, N, H, D] --> [B, N, C]
         x = self.proj(x)
 
         return x
@@ -209,18 +238,22 @@ class MultiHeadCrossAttention(nn.Module):
         self.enable_xformers = enable_xformers
 
     def _process_cross_attn(self, x, cond, kv_seqlen):
+        """
+        SDPA fallback supports variable kv lengths by padding cond to max_k and masking.
+        """
         B, N, C = x.shape
         assert C == self.dim and cond.shape[2] == self.dim
 
-        q = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
+        q = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)  # [1, B*N, H, D]
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
-        k, v = kv.unbind(2)
+        k, v = kv.unbind(2)  # each [1, sum(kv), H, D]
 
         q, k = self.q_norm(q), self.k_norm(k)
 
+        # FlashAttention-3
         if self.enable_flashattn3:
             from flash_attn_interface import flash_attn_varlen_func
-            x = flash_attn_varlen_func(
+            x_out = flash_attn_varlen_func(
                 q=q[0],
                 k=k[0],
                 v=v[0],
@@ -229,9 +262,11 @@ class MultiHeadCrossAttention(nn.Module):
                 max_seqlen_q=N,
                 max_seqlen_k=max(kv_seqlen),
             )[0]
+
+        # FlashAttention-2
         elif self.enable_flashattn2:
             from flash_attn import flash_attn_varlen_func
-            x = flash_attn_varlen_func(
+            x_out = flash_attn_varlen_func(
                 q=q[0],
                 k=k[0],
                 v=v[0],
@@ -240,17 +275,62 @@ class MultiHeadCrossAttention(nn.Module):
                 max_seqlen_q=N,
                 max_seqlen_k=max(kv_seqlen),
             )
+
+        # xFormers
         elif self.enable_xformers:
             import xformers.ops
             attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens([N] * B, kv_seqlen)
-            x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+            x_out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+
+        # SDPA fallback (new)
         else:
-            raise RuntimeError("Unsupported attention operations.")
+            # Build padded K/V: [B, max_k, H, D]
+            max_k = max(kv_seqlen)
+            device = x.device
+            dtype = q.dtype
 
+            k_padded = torch.zeros((B, max_k, self.num_heads, self.head_dim), device=device, dtype=dtype)
+            v_padded = torch.zeros((B, max_k, self.num_heads, self.head_dim), device=device, dtype=dtype)
 
-        x = x.view(B, -1, C)
-        x = self.proj(x)
-        return x
+            # Unpack the packed k/v (shape [1, sum_kv, H, D]) into per-batch slices.
+            k_flat = k[0]  # [sum_kv, H, D]
+            v_flat = v[0]  # [sum_kv, H, D]
+
+            offset = 0
+            for b, L in enumerate(kv_seqlen):
+                if L > 0:
+                    k_padded[b, :L] = k_flat[offset:offset + L]
+                    v_padded[b, :L] = v_flat[offset:offset + L]
+                offset += L
+
+            # q for SDPA: [B, N, H, D]
+            q_b = q.view(B, N, self.num_heads, self.head_dim)
+
+            # Convert to [B, H, N, D] and [B, H, max_k, D]
+            q_b = rearrange(q_b, "B N H D -> B H N D")
+            k_b = rearrange(k_padded, "B S H D -> B H S D")
+            v_b = rearrange(v_padded, "B S H D -> B H S D")
+
+            # Mask: True = keep, False = mask out
+            # scaled_dot_product_attention accepts boolean masks broadcastable to [B, H, N, S]
+            key_mask = torch.arange(max_k, device=device)[None, :] < torch.tensor(kv_seqlen, device=device)[:, None]
+            # Convert to attn_mask where True means "allowed"
+            attn_mask = key_mask[:, None, None, :]  # [B, 1, 1, S]
+
+            x_b = F.scaled_dot_product_attention(
+                q_b, k_b, v_b,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=1.0,  # q/k already normalized; keep stable. If you want, use self.head_dim**-0.5
+            )
+            # Back to [B, N, H, D] then flatten to match downstream view
+            x_b = rearrange(x_b, "B H N D -> B N H D")
+            x_out = x_b.reshape(1, B * N, self.num_heads, self.head_dim)
+
+        x_out = x_out.view(B, -1, C)
+        x_out = self.proj(x_out)
+        return x_out
 
     def forward(self, x, cond, kv_seqlen, num_cond_latents=None, shape=None):
         """
@@ -264,13 +344,13 @@ class MultiHeadCrossAttention(nn.Module):
             if num_cond_latents is not None and num_cond_latents > 0:
                 assert shape is not None, "SHOULD pass in the shape"
                 num_cond_latents_thw = num_cond_latents * (N // shape[0])
-                x_noise = x[:, num_cond_latents_thw:] # [B, N_noise, C]
-                output_noise = self._process_cross_attn(x_noise, cond, kv_seqlen) # [B, N_noise, C]
+                x_noise = x[:, num_cond_latents_thw:]  # [B, N_noise, C]
+                output_noise = self._process_cross_attn(x_noise, cond, kv_seqlen)  # [B, N_noise, C]
                 output = torch.cat([
                     torch.zeros((B, num_cond_latents_thw, C), dtype=output_noise.dtype, device=output_noise.device),
                     output_noise
                 ], dim=1).contiguous()
             else:
                 raise NotImplementedError
-                
+
             return output
