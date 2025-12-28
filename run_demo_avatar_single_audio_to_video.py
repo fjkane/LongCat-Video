@@ -102,8 +102,15 @@ def generate(args):
     text_encoder = UMT5EncoderModel.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="text_encoder", torch_dtype=torch.bfloat16)
     vae = AutoencoderKLWan.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="vae", torch_dtype=torch.bfloat16)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="scheduler", torch_dtype=torch.bfloat16)
+    bsa_params = dict(
+        chunk_3d_shape_q=[1, 4, 8],
+        chunk_3d_shape_k=[1, 4, 8],
+        # keep defaults unless you know better:
+        sparsity=0.875,
+        cdf_threshold=None,
+    )
     dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="avatar_single", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16, enable_flashattn3=False, enable_flashattn2=False, enable_xformers=False, enable_bsa=True,
-    bsa_params={},)
+    bsa_params=bsa_params,)
     
     # initialize audio models
     wav2vec_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')    
