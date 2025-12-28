@@ -75,6 +75,9 @@ class Attention(nn.Module):
             Tk = SKV // (H * W)
             latent_shape_q = (Tq, H, W)
             latent_shape_k = (Tk, H, W)
+            print("BSA shape:", shape, "cp_split_hw:", self.cp_split_hw, "latent_shape_q:", latent_shape_q,
+                  "latent_shape_k:", latent_shape_k, flush=True)
+
             x = flash_attn_bsa_3d(q, k, v, latent_shape_q, latent_shape_k, **self.bsa_params)
         elif self.enable_flashattn3:
             from flash_attn_interface import flash_attn_func
