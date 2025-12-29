@@ -1,0 +1,56 @@
+[project]
+name = "longcat-video"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.7.1+cu128",
+    "torchvision==0.22.1+cu128",
+    "torchaudio==2.7.1+cu128",
+    "audio-separator==0.30.2",
+    "av==12.0.0",
+    "cffi==2.0.0",
+    "chardet==5.2.0",
+    "diffusers==0.35.1",
+    "einops==0.8.0",
+    "ftfy==6.2.0",
+    "imageio==2.37.0",
+    "imageio-ffmpeg==0.6.0",
+    "librosa==0.11.0",
+    "loguru==0.7.2",
+    "numpy==1.26.4",
+    "nvidia-ml-py==13.580.65",
+    "onnx==1.18.0",
+    "onnxruntime==1.16.3",
+    "openai==1.75.0",
+    "opencv-python==4.9.0.80",
+    "psutil==6.0.0",
+    "pyarrow==20.0.0",
+    "pyloudnorm==0.1.1",
+    "scikit-image==0.25.2",
+    "scikit-learn==1.6.1",
+    "scipy==1.15.3",
+    "soundfile==0.13.1",
+    "soxr==0.5.0.post1",
+    "streamlit==1.50.0",
+    "sympy==1.13.3",
+    "transformers==4.41.0",
+    "tzdata==2025.2",
+    "accelerate==1.12.0",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+
+
+[[tool.uv.index]]
+name = "pytorch-cuda-128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda-128" }
+torchvision = { index = "pytorch-cuda-128" }
+torchaudio = { index = "pytorch-cuda-128" }
