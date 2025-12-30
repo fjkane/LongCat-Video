@@ -5,6 +5,7 @@ import PIL.Image
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch._dynamo
 from transformers import AutoTokenizer, UMT5EncoderModel
 from torchvision.io import write_video
 
@@ -15,11 +16,15 @@ from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DMod
 from longcat_video.context_parallel import context_parallel_util
 from longcat_video.context_parallel.context_parallel_util import init_context_parallel
 
+# --- GLOBAL CONFIGS ---
+# Enable TF32 for A40 (Ampere)
+torch.set_float32_matmul_precision('high')
+# Prevent Dynamo recompile limit crashes
+torch._dynamo.config.recompile_limit = 128
 
 def torch_gc():
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
-
 
 def generate(args):
     # Prompt and Parameters
@@ -62,8 +67,10 @@ def generate(args):
     dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", cp_split_hw=cp_split_hw,
                                                          torch_dtype=torch.bfloat16)
 
+    # 2. COMPILE STRATEGY
     if enable_compile:
-        dit = torch.compile(dit)
+        # Use dynamic=True because video segments can vary in internal shape/trace
+        dit = torch.compile(dit, dynamic=True)
 
     pipe = LongCatVideoPipeline(
         tokenizer=tokenizer,
@@ -73,10 +80,10 @@ def generate(args):
         dit=dit,
     )
 
-    # Send main model to GPU, but we will manage T5 and VAE separately
+    # Send main models to GPU
     pipe.to(local_rank)
 
-    # 2. INITIAL T2V GENERATION (480p)
+    # 3. INITIAL T2V GENERATION (480p)
     generator = torch.Generator(device=local_rank)
     generator.manual_seed(42 + global_rank)
 
@@ -91,27 +98,30 @@ def generate(args):
         generator=generator,
     )[0]
 
-    # After first generation, we can offload the text encoder to save 10GB+ VRAM
+    # Offload text encoder to save 10GB+ VRAM for the continuation loop
     pipe.text_encoder.to("cpu")
     torch_gc()
 
     if local_rank == 0:
         output_tensor = torch.from_numpy(np.array(output))
         output_tensor = (output_tensor * 255).clamp(0, 255).to(torch.uint8)
-        write_video(f"output_long_video_0.mp4", output_tensor, fps=15, video_codec="libx264")
+        write_video(f"output_long_video_initial.mp4", output_tensor, fps=15, video_codec="libx264")
 
     video = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
     video = [PIL.Image.fromarray(img) for img in video]
     del output
     torch_gc()
 
-    # 3. VIDEO CONTINUATION LOOP
+    # 4. VIDEO CONTINUATION LOOP
     all_generated_frames = video
     current_video = video
 
     for segment_idx in range(num_segments):
         if local_rank == 0:
             print(f"Generating segment {segment_idx + 1}/{num_segments}...")
+
+        # FIX: Move text_encoder back to GPU before generation
+        pipe.text_encoder.to(local_rank)
 
         output = pipe.generate_vc(
             video=current_video,
@@ -124,9 +134,13 @@ def generate(args):
             guidance_scale=4.0,
             generator=generator,
             use_kv_cache=True,
-            offload_kv_cache=True,  # Critical for A40 stability
+            offload_kv_cache=True,
             enhance_hf=True
         )[0]
+
+        # FIX: Move back to CPU after each segment to keep VRAM free for KV cache
+        pipe.text_encoder.to("cpu")
+        torch_gc()
 
         new_video = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
         new_video = [PIL.Image.fromarray(img) for img in new_video]
@@ -135,17 +149,14 @@ def generate(args):
         del output
         torch_gc()
 
-    # 4. REFINEMENT STAGE (720p)
+    # 5. REFINEMENT STAGE (720p)
     if local_rank == 0:
         print("Starting Refinement Stage...")
 
     refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
     pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
     pipe.dit.enable_loras(['refinement_lora'])
-    pipe.dit.enable_bsa()  # Enable Block Sparse Attention for memory saving
-
-    # Move VAE back to GPU just for the final decode if needed, otherwise leave on CPU
-    # LongCat VAE is small, but if you hit OOM, keep it on CPU.
+    pipe.dit.enable_bsa()
 
     cur_condition_video = None
     cur_num_cond_frames = 0
@@ -159,6 +170,10 @@ def generate(args):
         # Select the chunk of the original video to refine
         chunk = all_generated_frames[start_id:start_id + num_frames]
 
+        # Refinement doesn't always need the text encoder, but let's ensure it's where it needs to be
+        # based on the LongCat pipeline's requirements for 'generate_refine'
+        pipe.text_encoder.to(local_rank)
+
         output_refine = pipe.generate_refine(
             video=cur_condition_video,
             prompt='',
@@ -169,22 +184,23 @@ def generate(args):
             spatial_refine_only=spatial_refine_only
         )[0]
 
+        pipe.text_encoder.to("cpu") # Keep it on CPU while not in use
+
         new_video = [(output_refine[i] * 255).astype(np.uint8) for i in range(output_refine.shape[0])]
         new_video = [PIL.Image.fromarray(img) for img in new_video]
         del output_refine
 
         all_refine_frames.extend(new_video[cur_num_cond_frames:])
         cur_condition_video = new_video
-        cur_num_cond_frames = num_cond_frames if spatial_refine_only else num_cond_frames * 2
+        cur_num_cond_frames = num_frames if spatial_refine_only else num_frames * 2
         start_id = start_id + num_frames - num_cond_frames
 
-        if local_rank == 0 and segment_idx % 2 == 0:  # Save progress every 2 segments
+        if local_rank == 0 and segment_idx % 2 == 0:
             output_tensor = torch.from_numpy(np.array(all_refine_frames))
             fps = 15 if spatial_refine_only else 30
             write_video(f"output_refine_partial_{segment_idx}.mp4", output_tensor, fps=fps, video_codec="libx264")
 
         torch_gc()
-
 
 def _parse_args():
     parser = argparse.ArgumentParser()
@@ -192,7 +208,6 @@ def _parse_args():
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument('--enable_compile', action='store_true')
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     args = _parse_args()
