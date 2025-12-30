@@ -19,7 +19,8 @@ from longcat_video.context_parallel.context_parallel_util import init_context_pa
 # --- GLOBAL CONFIGS ---
 # Enable TF32 for A40 (Ampere architecture)
 torch.set_float32_matmul_precision('high')
-# Prevent Dynamo recompile limit crashes for RoPE 3D modules
+# Prevent Dynamo recompile limit crashes
+# We set this higher because the script switches between T2V and Refinement shapes
 torch._dynamo.config.recompile_limit = 128
 
 
@@ -76,8 +77,9 @@ def generate(args):
 
     # 3. COMPILE STRATEGY
     if enable_compile:
-        # dynamic=True handles the changing grid sizes between resolutions/segments
-        dit = torch.compile(dit, dynamic=True)
+        # FIX: Removed dynamic=True to avoid the SymInt attribute error in Torch 2.7
+        # The recompile_limit=128 above will catch the different shapes used.
+        dit = torch.compile(dit)
 
     pipe = LongCatVideoPipeline(
         tokenizer=tokenizer,
@@ -105,7 +107,7 @@ def generate(args):
         generator=generator,
     )[0]
 
-    # Offload text encoder to save 10GB+ VRAM for the continuation loop
+    # Offload text encoder to save 10GB+ VRAM
     pipe.text_encoder.to("cpu")
     torch_gc()
 
@@ -128,7 +130,7 @@ def generate(args):
         if local_rank == 0:
             print(f"Generating segment {segment_idx + 1}/{num_segments}...")
 
-        # FIX: Move text_encoder back to GPU for the forward pass
+        # Ensure text_encoder is on GPU for the forward pass
         pipe.text_encoder.to(local_rank)
 
         output = pipe.generate_vc(
@@ -146,7 +148,7 @@ def generate(args):
             enhance_hf=True
         )[0]
 
-        # FIX: Move back to CPU after each segment to keep VRAM free for KV cache
+        # Move back to CPU to keep VRAM free for KV cache
         pipe.text_encoder.to("cpu")
         torch_gc()
 
@@ -177,7 +179,7 @@ def generate(args):
 
         chunk = all_generated_frames[start_id:start_id + num_frames]
 
-        # Ensure encoder is on GPU for refinement if the pipeline requires it
+        # Ensure encoder is on GPU for refinement
         pipe.text_encoder.to(local_rank)
 
         output_refine = pipe.generate_refine(
