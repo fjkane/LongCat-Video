@@ -17,10 +17,9 @@ from longcat_video.context_parallel import context_parallel_util
 from longcat_video.context_parallel.context_parallel_util import init_context_parallel
 
 # --- GLOBAL CONFIGS ---
-# Enable TF32 for A40 (Ampere architecture)
+# Set memory management to avoid fragmentation on A40
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.set_float32_matmul_precision('high')
-# Prevent Dynamo recompile limit crashes
-# We set this higher because the script switches between T2V and Refinement shapes
 torch._dynamo.config.recompile_limit = 128
 
 
@@ -34,7 +33,6 @@ def generate(args):
     output_dir = args.output_dir
     checkpoint_dir = args.checkpoint_dir
 
-    # Prepare Distributed Env
     rank = int(os.environ.get('RANK', 0))
     num_gpus = torch.cuda.device_count()
     local_rank = rank % num_gpus
@@ -46,9 +44,8 @@ def generate(args):
     if local_rank == 0 and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    # Prompt and Parameters
-    prompt = "realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard along a winding mountain road. The skateboarder starts in a standing position, then gradually lowers into a crouch, extending one hand to touch the road surface while maintaining a low center of gravity to navigate a sharp curve. After completing the turn, the skateboarder rises back to a standing position and continues gliding forward. The background features lush green hills flanking both sides of the road, with distant snow-capped mountain peaks rising against a clear, bright blue sky. The camera follows closely from behind, smoothly tracking the skateboarder’s movements and capturing the dynamic scenery along the route. The scene is shot in natural daylight, highlighting the vivid outdoor environment and the skateboarder’s fluid actions."
-    negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+    prompt = "In a realistic filming style, a man in a casual linen shirt sits at a sun-drenched wooden table featuring a ceramic coffee cup, a porcelain creamer pot, a flaky golden croissant, and a glass jar of orange marmalade. The scene begins with the man pouring cream into his coffee, creating swirling patterns, before stirring it gently with a silver spoon. He then picks up the croissant to take a large bite, sets it down, and uses a butter knife to spread a thick layer of glistening marmalade onto the bitten interior surface before taking another bite. The video continues in a steady, rhythmic pace, showing the man repeating this cycle of biting and spreading until the croissant is completely consumed, leaving only golden crumbs on the plate. The camera maintains a focused, close-up perspective with soft natural lighting, capturing the tactile textures of the pastry and the steam rising from the coffee in a calm, continuous sequence."
+    negative_prompt = "Bright tones, overexposed, static, blurred details..."
 
     num_segments = 11
     num_frames = 61
@@ -75,10 +72,7 @@ def generate(args):
     dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", cp_split_hw=cp_split_hw,
                                                          torch_dtype=torch.bfloat16)
 
-    # 3. COMPILE STRATEGY
     if enable_compile:
-        # FIX: Removed dynamic=True to avoid the SymInt attribute error in Torch 2.7
-        # The recompile_limit=128 above will catch the different shapes used.
         dit = torch.compile(dit)
 
     pipe = LongCatVideoPipeline(
@@ -89,10 +83,9 @@ def generate(args):
         dit=dit,
     )
 
-    # Send main models to GPU
     pipe.to(local_rank)
 
-    # 4. INITIAL T2V GENERATION (480p)
+    # 3. INITIAL T2V GENERATION (480p)
     generator = torch.Generator(device=local_rank)
     generator.manual_seed(42 + global_rank)
 
@@ -107,7 +100,6 @@ def generate(args):
         generator=generator,
     )[0]
 
-    # Offload text encoder to save 10GB+ VRAM
     pipe.text_encoder.to("cpu")
     torch_gc()
 
@@ -122,7 +114,7 @@ def generate(args):
     del output
     torch_gc()
 
-    # 5. VIDEO CONTINUATION LOOP
+    # 4. VIDEO CONTINUATION LOOP
     all_generated_frames = video
     current_video = video
 
@@ -130,9 +122,7 @@ def generate(args):
         if local_rank == 0:
             print(f"Generating segment {segment_idx + 1}/{num_segments}...")
 
-        # Ensure text_encoder is on GPU for the forward pass
         pipe.text_encoder.to(local_rank)
-
         output = pipe.generate_vc(
             video=current_video,
             prompt=prompt,
@@ -148,7 +138,6 @@ def generate(args):
             enhance_hf=True
         )[0]
 
-        # Move back to CPU to keep VRAM free for KV cache
         pipe.text_encoder.to("cpu")
         torch_gc()
 
@@ -159,7 +148,17 @@ def generate(args):
         del output
         torch_gc()
 
-    # 6. REFINEMENT STAGE (720p)
+    # --- FIX 1: CLEAR EVERYTHING BEFORE REFINEMENT ---
+    if local_rank == 0:
+        print("Clearing cache for Refinement Stage...")
+
+    # Reset KV cache explicitly if the pipeline has a reset method
+    if hasattr(pipe.dit, "reset_kv_cache"):
+        pipe.dit.reset_kv_cache()
+
+    torch_gc()
+
+    # 5. REFINEMENT STAGE (720p)
     if local_rank == 0:
         print("Starting Refinement Stage...")
 
@@ -179,8 +178,11 @@ def generate(args):
 
         chunk = all_generated_frames[start_id:start_id + num_frames]
 
-        # Ensure encoder is on GPU for refinement
+        # FIX 2: During VAE encoding (the crash point), offload DIT to CPU
+        # to ensure the VAE has maximum VRAM for the 720p sequence
+        pipe.dit.to("cpu")
         pipe.text_encoder.to(local_rank)
+        torch_gc()
 
         output_refine = pipe.generate_refine(
             video=cur_condition_video,
@@ -192,6 +194,8 @@ def generate(args):
             spatial_refine_only=spatial_refine_only
         )[0]
 
+        # Bring DIT back for next iteration if needed (or let the pipeline handle)
+        pipe.dit.to(local_rank)
         pipe.text_encoder.to("cpu")
 
         new_video = [(output_refine[i] * 255).astype(np.uint8) for i in range(output_refine.shape[0])]
@@ -205,7 +209,7 @@ def generate(args):
 
         if local_rank == 0 and segment_idx % 2 == 0:
             output_tensor = torch.from_numpy(np.array(all_refine_frames))
-            fps = 15 if spatial_refine_only else 30
+            fps = 30
             refine_path = os.path.join(output_dir, f"output_refine_partial_{segment_idx}.mp4")
             write_video(refine_path, output_tensor, fps=fps, video_codec="libx264")
 
