@@ -112,7 +112,7 @@ def generate(args):
     generator = torch.Generator(device=local_rank).manual_seed(42 + global_rank)
 
     # 3. INITIAL T2V GENERATION
-    prompt = "realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard along a winding mountain road."
+    prompt = "In a realistic filming style, a medium shot captures a man in a casual linen shirt sitting at a wooden table, framed from the waist up to include his face and upper body as he enjoys breakfast. The table is set with a ceramic coffee cup, a creamer pot, a golden croissant, and a jar of orange marmalade. The man first reaches for the porcelain creamer, pouring it into his coffee and stirring it with a silver spoon while looking down with a relaxed expression. He then picks up the croissant to take a bite, subsequently using a butter knife to spread marmalade onto the bitten surface before taking the next bite. The camera remains at a steady medium angle, keeping the man’s coordinated hand movements and facial reactions centered in the frame as he repeats this process until the croissant is entirely finished. The scene is bathed in warm, natural light from a nearby window, emphasizing the man's calm morning ritual and the cozy interior atmosphere."
     negative_prompt = "Bright tones, overexposed, static, blurred details, ugly, deformed."
 
     if local_rank == 0:
