@@ -29,24 +29,18 @@ def torch_gc():
 
 
 def save_segment(frames, folder, filename, fps=15):
-    """
-    Robustly saves frames to video.
-    Expects frames as a list of numpy arrays [H, W, C] in range [0, 1] or [0, 255].
-    """
+    """Robustly saves frames to video."""
     output_path = os.path.join(folder, filename)
-
-    # Convert list of frames to a single numpy array [T, H, W, C]
     video_np = np.stack([np.array(f) for f in frames], axis=0)
 
-    # Ensure range is 0-255 uint8
-    if video_np.max() <= 1.1:  # Likely float [0, 1]
+    if video_np.max() <= 1.1:
         video_np = (video_np * 255).astype(np.uint8)
     else:
         video_np = video_np.astype(np.uint8)
 
-    # Final check for Black Frames: if mean is 0, the model failed to generate
-    if video_np.mean() < 0.1:
-        print(f"WARNING: Segment {filename} appears to be black. Check Model/Dtype stability.")
+    # Diagnostic: check if the result is actually black
+    if video_np.mean() < 1.0:
+        print(f"!!! CRITICAL WARNING: {filename} is almost entirely black (Mean pixel: {video_np.mean()})")
 
     tensor_frames = torch.from_numpy(video_np)
     write_video(output_path, tensor_frames, fps=fps, video_codec="libx264")
@@ -82,7 +76,6 @@ def generate(args):
                                                                 torch_dtype=torch.bfloat16)
     dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", torch_dtype=torch.bfloat16)
 
-    # Enable VAE tiling to prevent OOM
     if hasattr(vae, "enable_tiling"):
         vae.enable_tiling()
 
@@ -105,9 +98,15 @@ def generate(args):
     spatial_refine_only = False
     generator = torch.Generator(device=local_rank).manual_seed(42 + dist.get_rank())
 
-    # 2. INITIAL T2V GENERATION
-    prompt = "realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard..."
-    negative_prompt = "Bright tones, overexposed, static, blurred details..."
+    # 2. INITIAL T2V GENERATION (FIXED)
+    prompt = "realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard along a winding mountain road."
+    negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality."
+
+    # Ensure Text Encoder is on GPU and fully active for the first call
+    pipe.text_encoder.to(local_rank)
+
+    if local_rank == 0:
+        print("Starting Initial T2V Generation...")
 
     output = pipe.generate_t2v(
         prompt=prompt,
@@ -116,18 +115,17 @@ def generate(args):
         width=832,
         num_frames=num_frames,
         num_inference_steps=50,
-        guidance_scale=4.0,
+        guidance_scale=6.0,  # Increased slightly for better initial stability
         generator=generator,
     )[0]
 
-    # Critical: Offload text encoder to save 10GB RAM
+    # Move to CPU ONLY after the first gen is successful
     pipe.text_encoder.to("cpu")
     torch_gc()
 
     if local_rank == 0:
         save_segment(output, output_dir, "segment_00_initial.mp4")
 
-    # Convert to PIL/List for consistency
     all_generated_frames = []
     for f in output:
         img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
@@ -181,7 +179,7 @@ def generate(args):
 
     refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
     pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
-    pipe.dit.enable_loras(['refinement_lora'])
+    pipe.dit.enable_loras(['refinement_loras'])
     pipe.dit.enable_bsa()
 
     cur_condition_video = None
