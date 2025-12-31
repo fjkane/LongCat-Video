@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 
-UV_CACHE="/workspace/cache/uv"
-UV_LINK_MODE=copy
+export UV_CACHE="/workspace/cache/uv"
+export UV_LINK_MODE=copy
