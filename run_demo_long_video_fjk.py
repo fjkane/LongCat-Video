@@ -24,21 +24,36 @@ torch._dynamo.config.recompile_limit = 128
 
 
 def torch_gc():
-    """Clear memory across both CPU and GPU."""
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
 
 
 def save_segment(frames, folder, filename, fps=15):
-    """Helper to save a list of PIL images or numpy arrays as a video clip."""
+    """
+    Robustly saves frames to video.
+    Expects frames as a list of numpy arrays [H, W, C] in range [0, 1] or [0, 255].
+    """
     output_path = os.path.join(folder, filename)
-    tensor_frames = torch.from_numpy(np.array([np.array(f) for f in frames]))
+
+    # Convert list of frames to a single numpy array [T, H, W, C]
+    video_np = np.stack([np.array(f) for f in frames], axis=0)
+
+    # Ensure range is 0-255 uint8
+    if video_np.max() <= 1.1:  # Likely float [0, 1]
+        video_np = (video_np * 255).astype(np.uint8)
+    else:
+        video_np = video_np.astype(np.uint8)
+
+    # Final check for Black Frames: if mean is 0, the model failed to generate
+    if video_np.mean() < 0.1:
+        print(f"WARNING: Segment {filename} appears to be black. Check Model/Dtype stability.")
+
+    tensor_frames = torch.from_numpy(video_np)
     write_video(output_path, tensor_frames, fps=fps, video_codec="libx264")
     return filename
 
 
 def generate(args):
-    # Ensure Hugging Face cache is migrated
     try:
         move_cache()
     except Exception:
@@ -47,7 +62,6 @@ def generate(args):
     output_dir = args.output_dir
     checkpoint_dir = args.checkpoint_dir
 
-    # Distributed Setup
     rank = int(os.environ.get('RANK', 0))
     num_gpus = torch.cuda.device_count()
     local_rank = rank % num_gpus
@@ -59,22 +73,6 @@ def generate(args):
     if local_rank == 0 and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    # Parameters
-    num_segments = 11
-    num_frames = 61
-    num_cond_frames = 13
-    spatial_refine_only = False
-    context_parallel_size = args.context_parallel_size
-    enable_compile = args.enable_compile
-
-    global_rank = dist.get_rank()
-    num_processes = dist.get_world_size()
-
-    init_context_parallel(context_parallel_size=context_parallel_size, global_rank=global_rank,
-                          world_size=num_processes)
-    cp_size = context_parallel_util.get_cp_size()
-    cp_split_hw = context_parallel_util.get_optimal_split(cp_size)
-
     # 1. LOAD MODELS
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, subfolder="tokenizer", torch_dtype=torch.bfloat16)
     text_encoder = UMT5EncoderModel.from_pretrained(checkpoint_dir, subfolder="text_encoder",
@@ -82,13 +80,13 @@ def generate(args):
     vae = AutoencoderKLWan.from_pretrained(checkpoint_dir, subfolder="vae", torch_dtype=torch.bfloat16)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(checkpoint_dir, subfolder="scheduler",
                                                                 torch_dtype=torch.bfloat16)
-    dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", cp_split_hw=cp_split_hw,
-                                                         torch_dtype=torch.bfloat16)
+    dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", torch_dtype=torch.bfloat16)
 
+    # Enable VAE tiling to prevent OOM
     if hasattr(vae, "enable_tiling"):
         vae.enable_tiling()
 
-    if enable_compile:
+    if args.enable_compile:
         dit = torch.compile(dit)
 
     pipe = LongCatVideoPipeline(
@@ -100,11 +98,15 @@ def generate(args):
     )
     pipe.to(local_rank)
 
-    # 2. INITIAL T2V GENERATION
-    generator = torch.Generator(device=local_rank)
-    generator.manual_seed(42 + global_rank)
+    # Parameters
+    num_segments = 11
+    num_frames = 61
+    num_cond_frames = 13
+    spatial_refine_only = False
+    generator = torch.Generator(device=local_rank).manual_seed(42 + dist.get_rank())
 
-    prompt = "in a realistic filming style, a medium shot captures a man in a casual linen shirt sitting at a wooden table, framed from the waist up to include his face and upper body as he enjoys breakfast. The table is set with a ceramic coffee cup, a creamer pot, a golden croissant, and a jar of orange marmalade. The man first reaches for the porcelain creamer, pouring it into his coffee and stirring it with a silver spoon while looking down with a relaxed expression. He then picks up the croissant to take a bite, subsequently using a butter knife to spread marmalade onto the bitten surface before taking the next bite. The camera remains at a steady medium angle, keeping the man’s coordinated hand movements and facial reactions centered in the frame as he repeats this process until the croissant is entirely finished. The scene is bathed in warm, natural light from a nearby window, emphasizing the man's calm morning ritual and the cozy interior atmosphere."
+    # 2. INITIAL T2V GENERATION
+    prompt = "realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard..."
     negative_prompt = "Bright tones, overexposed, static, blurred details..."
 
     output = pipe.generate_t2v(
@@ -118,23 +120,27 @@ def generate(args):
         generator=generator,
     )[0]
 
-    # Save initial low-res segment and offload encoder
+    # Critical: Offload text encoder to save 10GB RAM
     pipe.text_encoder.to("cpu")
     torch_gc()
 
     if local_rank == 0:
         save_segment(output, output_dir, "segment_00_initial.mp4")
 
-    all_generated_frames = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
-    all_generated_frames = [PIL.Image.fromarray(img) for img in all_generated_frames]
+    # Convert to PIL/List for consistency
+    all_generated_frames = []
+    for f in output:
+        img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
+        all_generated_frames.append(PIL.Image.fromarray(img_np))
+
     current_video = all_generated_frames
     del output
     torch_gc()
 
-    # 3. VIDEO CONTINUATION LOOP (UNLIMITED LENGTH POSSIBLE)
+    # 3. VIDEO CONTINUATION LOOP
     for segment_idx in range(num_segments):
         if local_rank == 0:
-            print(f"Generating continuation segment {segment_idx + 1}...")
+            print(f"Continuation Segment {segment_idx + 1}...")
 
         pipe.text_encoder.to(local_rank)
         output = pipe.generate_vc(
@@ -155,8 +161,10 @@ def generate(args):
         pipe.text_encoder.to("cpu")
         torch_gc()
 
-        new_video_frames = [(output[i] * 255).astype(np.uint8) for i in range(output.shape[0])]
-        new_video_pil = [PIL.Image.fromarray(img) for img in new_video_frames]
+        new_video_pil = []
+        for f in output:
+            img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
+            new_video_pil.append(PIL.Image.fromarray(img_np))
 
         if local_rank == 0:
             save_segment(new_video_pil, output_dir, f"segment_{segment_idx + 1:02d}_continuation.mp4")
@@ -183,11 +191,10 @@ def generate(args):
 
     for segment_idx in range(num_segments + 1):
         if local_rank == 0:
-            print(f"Refining segment {segment_idx} (720p)...")
+            print(f"Refinement Segment {segment_idx} (720p)...")
 
         chunk = all_generated_frames[start_id:start_id + num_frames]
 
-        # Strategic offloading to prevent System RAM OOM and VRAM overflow
         pipe.dit.to("cpu")
         pipe.text_encoder.to(local_rank)
         torch_gc()
@@ -205,8 +212,10 @@ def generate(args):
         pipe.dit.to(local_rank)
         pipe.text_encoder.to("cpu")
 
-        new_video_frames = [(output_refine[i] * 255).astype(np.uint8) for i in range(output_refine.shape[0])]
-        new_video_pil = [PIL.Image.fromarray(img) for img in new_video_frames]
+        new_video_pil = []
+        for f in output_refine:
+            img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
+            new_video_pil.append(PIL.Image.fromarray(img_np))
 
         if local_rank == 0:
             fname = f"refine_{segment_idx:02d}.mp4"
@@ -225,7 +234,7 @@ def generate(args):
         with open(txt_path, "w") as f:
             for f_name in refined_filenames:
                 f.write(f"file '{f_name}'\n")
-        print(f"\n[Generation Complete] Final steps: ffmpeg -f concat -safe 0 -i {txt_path} -c copy final_video.mp4")
+        print(f"\n[DONE] ffmpeg -f concat -safe 0 -i {txt_path} -c copy final_video.mp4")
 
 
 def _parse_args():
