@@ -18,9 +18,9 @@ from longcat_video.context_parallel import context_parallel_util
 from longcat_video.context_parallel.context_parallel_util import init_context_parallel
 
 # --- GLOBAL STABILITY CONFIGS ---
+# Optimization for A40 memory and precision
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 torch.set_float32_matmul_precision('high')
-torch._dynamo.config.recompile_limit = 128
 
 
 def torch_gc():
@@ -29,18 +29,16 @@ def torch_gc():
 
 
 def save_segment(frames, folder, filename, fps=15):
-    """Robustly saves frames to video."""
+    """Helper to save frames as video. Corrects for black frame/normalization issues."""
     output_path = os.path.join(folder, filename)
     video_np = np.stack([np.array(f) for f in frames], axis=0)
 
-    if video_np.max() <= 1.1:
-        video_np = (video_np * 255).astype(np.uint8)
-    else:
-        video_np = video_np.astype(np.uint8)
-
-    # Diagnostic: check if the result is actually black
-    if video_np.mean() < 1.0:
-        print(f"!!! CRITICAL WARNING: {filename} is almost entirely black (Mean pixel: {video_np.mean()})")
+    # Normalization check
+    if video_np.dtype != np.uint8:
+        if video_np.max() <= 1.1:
+            video_np = (video_np * 255).astype(np.uint8)
+        else:
+            video_np = video_np.astype(np.uint8)
 
     tensor_frames = torch.from_numpy(video_np)
     write_video(output_path, tensor_frames, fps=fps, video_codec="libx264")
@@ -56,6 +54,7 @@ def generate(args):
     output_dir = args.output_dir
     checkpoint_dir = args.checkpoint_dir
 
+    # Distributed Environment
     rank = int(os.environ.get('RANK', 0))
     num_gpus = torch.cuda.device_count()
     local_rank = rank % num_gpus
@@ -67,20 +66,34 @@ def generate(args):
     if local_rank == 0 and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-    # 1. LOAD MODELS
+    global_rank = dist.get_rank()
+    num_processes = dist.get_world_size()
+
+    # 1. SETUP CONTEXT PARALLEL
+    init_context_parallel(context_parallel_size=args.context_parallel_size,
+                          global_rank=global_rank,
+                          world_size=num_processes)
+    cp_size = context_parallel_util.get_cp_size()
+    cp_split_hw = context_parallel_util.get_optimal_split(cp_size)
+
+    # 2. LOAD MODELS (Directly in Bfloat16)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir, subfolder="tokenizer", torch_dtype=torch.bfloat16)
     text_encoder = UMT5EncoderModel.from_pretrained(checkpoint_dir, subfolder="text_encoder",
                                                     torch_dtype=torch.bfloat16)
     vae = AutoencoderKLWan.from_pretrained(checkpoint_dir, subfolder="vae", torch_dtype=torch.bfloat16)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(checkpoint_dir, subfolder="scheduler",
                                                                 torch_dtype=torch.bfloat16)
-    dit = LongCatVideoTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="dit", torch_dtype=torch.bfloat16)
+
+    # Load DIT without compilation to avoid CP_Split Attribute Errors
+    dit = LongCatVideoTransformer3DModel.from_pretrained(
+        checkpoint_dir,
+        subfolder="dit",
+        cp_split_hw=cp_split_hw,
+        torch_dtype=torch.bfloat16
+    )
 
     if hasattr(vae, "enable_tiling"):
         vae.enable_tiling()
-
-    if args.enable_compile:
-        dit = torch.compile(dit)
 
     pipe = LongCatVideoPipeline(
         tokenizer=tokenizer,
@@ -96,17 +109,17 @@ def generate(args):
     num_frames = 61
     num_cond_frames = 13
     spatial_refine_only = False
-    generator = torch.Generator(device=local_rank).manual_seed(42 + dist.get_rank())
+    generator = torch.Generator(device=local_rank).manual_seed(42 + global_rank)
 
-    # 2. INITIAL T2V GENERATION (FIXED)
+    # 3. INITIAL T2V GENERATION
     prompt = "realistic filming style, a person wearing a dark helmet, a deep-colored jacket, blue jeans, and bright yellow shoes rides a skateboard along a winding mountain road."
-    negative_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality."
-
-    # Ensure Text Encoder is on GPU and fully active for the first call
-    pipe.text_encoder.to(local_rank)
+    negative_prompt = "Bright tones, overexposed, static, blurred details, ugly, deformed."
 
     if local_rank == 0:
-        print("Starting Initial T2V Generation...")
+        print("Starting Initial T2V Generation (Flash Attention enabled)...")
+
+    # Ensure encoder is on GPU for the first pass
+    pipe.text_encoder.to(local_rank)
 
     output = pipe.generate_t2v(
         prompt=prompt,
@@ -115,17 +128,17 @@ def generate(args):
         width=832,
         num_frames=num_frames,
         num_inference_steps=50,
-        guidance_scale=6.0,  # Increased slightly for better initial stability
+        guidance_scale=6.0,
         generator=generator,
     )[0]
 
-    # Move to CPU ONLY after the first gen is successful
     pipe.text_encoder.to("cpu")
     torch_gc()
 
     if local_rank == 0:
         save_segment(output, output_dir, "segment_00_initial.mp4")
 
+    # Setup list of frames for continuation
     all_generated_frames = []
     for f in output:
         img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
@@ -135,10 +148,10 @@ def generate(args):
     del output
     torch_gc()
 
-    # 3. VIDEO CONTINUATION LOOP
+    # 4. VIDEO CONTINUATION LOOP
     for segment_idx in range(num_segments):
         if local_rank == 0:
-            print(f"Continuation Segment {segment_idx + 1}...")
+            print(f"Continuation Segment {segment_idx + 1}/{num_segments}...")
 
         pipe.text_encoder.to(local_rank)
         output = pipe.generate_vc(
@@ -159,10 +172,8 @@ def generate(args):
         pipe.text_encoder.to("cpu")
         torch_gc()
 
-        new_video_pil = []
-        for f in output:
-            img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
-            new_video_pil.append(PIL.Image.fromarray(img_np))
+        new_video_pil = [PIL.Image.fromarray((f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)) for f
+                         in output]
 
         if local_rank == 0:
             save_segment(new_video_pil, output_dir, f"segment_{segment_idx + 1:02d}_continuation.mp4")
@@ -172,14 +183,17 @@ def generate(args):
         del output
         torch_gc()
 
-    # 4. REFINEMENT STAGE
+    # 5. REFINEMENT STAGE
     if hasattr(pipe.dit, "reset_kv_cache"):
         pipe.dit.reset_kv_cache()
     torch_gc()
 
+    if local_rank == 0:
+        print("Starting Refinement Stage (Iterative Saving)...")
+
     refinement_lora_path = os.path.join(checkpoint_dir, 'lora/refinement_lora.safetensors')
     pipe.dit.load_lora(refinement_lora_path, 'refinement_lora')
-    pipe.dit.enable_loras(['refinement_loras'])
+    pipe.dit.enable_loras(['refinement_lora'])
     pipe.dit.enable_bsa()
 
     cur_condition_video = None
@@ -189,10 +203,11 @@ def generate(args):
 
     for segment_idx in range(num_segments + 1):
         if local_rank == 0:
-            print(f"Refinement Segment {segment_idx} (720p)...")
+            print(f"Refining segment {segment_idx}...")
 
         chunk = all_generated_frames[start_id:start_id + num_frames]
 
+        # Memory management: move DIT to CPU while VAE encodes
         pipe.dit.to("cpu")
         pipe.text_encoder.to(local_rank)
         torch_gc()
@@ -210,10 +225,8 @@ def generate(args):
         pipe.dit.to(local_rank)
         pipe.text_encoder.to("cpu")
 
-        new_video_pil = []
-        for f in output_refine:
-            img_np = (f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)
-            new_video_pil.append(PIL.Image.fromarray(img_np))
+        new_video_pil = [PIL.Image.fromarray((f * 255).astype(np.uint8) if f.max() <= 1.1 else f.astype(np.uint8)) for f
+                         in output_refine]
 
         if local_rank == 0:
             fname = f"refine_{segment_idx:02d}.mp4"
@@ -223,16 +236,17 @@ def generate(args):
         cur_condition_video = new_video_pil
         cur_num_cond_frames = num_frames if spatial_refine_only else num_frames * 2
         start_id = start_id + num_frames - num_cond_frames
-
         del output_refine
         torch_gc()
 
+    # 6. FINAL MANIFEST
     if local_rank == 0:
         txt_path = os.path.join(output_dir, "inputs.txt")
         with open(txt_path, "w") as f:
             for f_name in refined_filenames:
                 f.write(f"file '{f_name}'\n")
-        print(f"\n[DONE] ffmpeg -f concat -safe 0 -i {txt_path} -c copy final_video.mp4")
+        print(f"\n[Generation Complete] Directory: {output_dir}")
+        print(f"Combine with: ffmpeg -f concat -safe 0 -i {txt_path} -c copy final_video.mp4")
 
 
 def _parse_args():
@@ -240,7 +254,6 @@ def _parse_args():
     parser.add_argument("--context_parallel_size", type=int, default=1)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument('--enable_compile', action='store_true')
     return parser.parse_args()
 
 
